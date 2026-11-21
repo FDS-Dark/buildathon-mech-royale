@@ -39,6 +39,7 @@ def main() -> None:
     rng = random.Random(67)
     bot = Bot(HELLO)
     assert len(bot.roofs) >= 50
+    assert len(bot.hide_sites) >= 500
     start = time.perf_counter()
     for index in range(3000):
         obs = copy.deepcopy(BASE)
@@ -123,6 +124,59 @@ def main() -> None:
     ]
     action = bot.act(laser_obs)
     assert not action.get("fire", [False, False])[1], action
+
+    # Regression: qualification opening movement stays below the 5 m/s sound
+    # threshold and does not reveal us by shooting a non-contact opponent.
+    stealth_bot = Bot(HELLO)
+    stealth_obs = copy.deepcopy(BASE)
+    stealth_obs["mechs"] = []
+    stealth_action = stealth_bot.act(stealth_obs)
+    assert math.hypot(*stealth_action["move"]) <= 0.390001, stealth_action
+    assert stealth_bot.rotation_deadline > stealth_obs["t"] + 30.0
+
+    seen_obs = copy.deepcopy(stealth_obs)
+    seen_obs["tick"] = 1
+    seen_obs["t"] = 0.05
+    seen_obs["mechs"] = [
+        {"id": 7, "kind": "mech", "pos": [stealth_obs["self"]["pos"][0] + 85, stealth_obs["self"]["pos"][1], stealth_obs["self"]["pos"][2]],
+         "vel": [0, 0, 0], "aim": [math.pi, 0], "hp": 1400, "max_hp": 1400,
+         "cubes": 0, "weapons": ["gun"], "charging": False}
+    ]
+    seen_action = stealth_bot.act(seen_obs)
+    assert not any(seen_action.get("fire", [False, False])), seen_action
+
+    # Once centered under the chosen canopy, hold completely still until a
+    # contact or zone deadline forces a move.
+    settled_obs = copy.deepcopy(BASE)
+    settled_obs["tick"] = 2
+    settled_obs["t"] = 0.1
+    settled_obs["mechs"] = []
+    settled_obs["sounds"] = []
+    settled_obs["self"]["pos"][:2] = [stealth_bot.hide_goal.x, stealth_bot.hide_goal.y]
+    settled_action = stealth_bot.act(settled_obs)
+    assert settled_action["move"] == [0.0, 0.0], settled_action
+
+    # Crossing the computed rotation deadline immediately enables full-speed
+    # travel; there is no second grace period that can leak hundreds of HP.
+    rotate_obs = copy.deepcopy(BASE)
+    rotate_obs["tick"] = 1800
+    rotate_obs["t"] = stealth_bot.rotation_deadline + 0.1
+    rotate_obs["self"]["energy"] = rotate_obs["self"]["max_energy"]
+    rotate_obs["mechs"] = []
+    rotate_obs["sounds"] = []
+    rotate_action = stealth_bot.act(rotate_obs)
+    assert rotate_action.get("boost") is True, rotate_action
+
+    # Zone damage is not hostile contact and must not trigger evasive jumping.
+    zone_bot = Bot(HELLO)
+    zone_obs = copy.deepcopy(BASE)
+    zone_obs["tick"] = 3100
+    zone_obs["t"] = 155.0
+    zone_obs["self"]["hp"] -= 10
+    zone_obs["self"]["in_zone"] = False
+    zone_obs["events"] = [{"type": "damaged", "amount": 10, "weapon": "zone", "bearing": None, "by": None}]
+    zone_action = zone_bot.act(zone_obs)
+    assert zone_action.get("jump") is False, zone_action
 
     print(f"PASS: 3000 adversarial observations + state regressions in {elapsed:.3f}s ({elapsed / 3:.3f} ms/decision)")
 

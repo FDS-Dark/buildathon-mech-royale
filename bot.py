@@ -163,19 +163,26 @@ class Roof:
     holes: list[list[float]]
 
 
+@dataclass(slots=True)
+class HideSite:
+    x: float
+    y: float
+    score: float
+
+
 class Bot:
-    name = "roof-rat-v2"
+    name = "ghost-canopy-v1"
 
     def __init__(self, hello: mf.Hello):
         self.config = hello["config"]
         self.rng = random.Random(int(hello["seed"]))
         self.reach = float(self.config["loot"]["pickup_radius"])
-        self.memory_s = float(self.config["vision"]["memory_s"])
         self.prisms: list[dict[str, Any]] = []
         self.roofs = self._load_roofs(hello)
-        self.enemy_memory: dict[int, tuple[float, list[float], list[float], float]] = {}
-        self.roof_goal: Roof | None = None
-        self.roof_goal_until = 0.0
+        self.hide_sites = self._load_hide_sites(hello)
+        self.hide_goal: HideSite | None = None
+        self.hide_goal_until = 0.0
+        self.rotation_deadline = 0.0
         self.last_target: tuple[float, list[float], list[float]] | None = None
         self.last_hp = float(self.config["mech"]["hp"])
         self.last_damage_t = -999.0
@@ -183,6 +190,37 @@ class Bot:
         self.last_damage_bearing_t = -999.0
         self.strafe_sign = -1.0 if hello["slot"] & 1 else 1.0
         self.last_strafe_flip_t = -999.0
+
+    def _load_hide_sites(self, hello: mf.Hello) -> list[HideSite]:
+        try:
+            path = os.path.join(hello["map"]["dir"], "v2", "world.json")
+            with open(path, "r", encoding="utf-8") as handle:
+                trees = json.load(handle)["trees"]
+        except (OSError, ValueError, KeyError):
+            return []
+        fields = trees["fields"]
+        stride = len(fields)
+        idx = {name: fields.index(name) for name in fields}
+        records = [trees["data"][start:start + stride] for start in range(0, len(trees["data"]), stride)]
+        low = [
+            row for row in records
+            if float(row[idx["crownBase"]]) <= 10.0 and float(row[idx["crownR"]]) >= 2.0
+        ]
+        sites: list[HideSite] = []
+        for row in low:
+            x = float(row[idx.get("crownX", idx["x"])])
+            y = float(row[idx.get("crownY", idx["y"])])
+            overlap = 0.0
+            for other in low:
+                ox = float(other[idx.get("crownX", idx["x"])])
+                oy = float(other[idx.get("crownY", idx["y"])])
+                radius = float(other[idx["crownR"]])
+                distance = math.hypot(x - ox, y - oy)
+                if distance < radius:
+                    overlap += 1.0 + (radius - distance) / max(radius, 1.0)
+            if overlap >= 2.0:
+                sites.append(HideSite(x, y, overlap))
+        return sites
 
     def _load_roofs(self, hello: mf.Hello) -> list[Roof]:
         try:
@@ -319,6 +357,73 @@ class Bot:
         return best
 
     @staticmethod
+    def _circle_margin(x: float, y: float, center: list[float], radius: float) -> float:
+        return radius - math.hypot(x - center[0], y - center[1])
+
+    def _zone_cross_time(self, obs: mf.Observation, padding: float = 8.0) -> float:
+        """First time our stationary position is touched by the moving boundary."""
+        now = float(obs["t"])
+        zone = obs["zone"]
+        end = float(zone["shrink_end"])
+        if end <= now:
+            return now
+        pos = obs["self"]["pos"]
+        next_margin = self._circle_margin(pos[0], pos[1], zone["next_center"], float(zone["next_radius"])) - padding
+        if next_margin >= 0.0:
+            return end + 999.0
+        start_t = max(now, float(zone["shrink_start"]))
+        if start_t >= end:
+            return now
+        # The observation exposes the already-interpolated current circle, so
+        # interpolation starts at now while shrinking and at shrink_start while holding.
+        base_t = now if now >= float(zone["shrink_start"]) else start_t
+        base_center = zone["center"]
+        base_radius = float(zone["radius"])
+        if self._circle_margin(pos[0], pos[1], base_center, base_radius) <= padding:
+            return now
+        lo, hi = base_t, end
+        for _ in range(22):
+            mid = (lo + hi) * 0.5
+            alpha = clamp((mid - base_t) / max(end - base_t, 1e-6), 0.0, 1.0)
+            center = [
+                base_center[0] + (zone["next_center"][0] - base_center[0]) * alpha,
+                base_center[1] + (zone["next_center"][1] - base_center[1]) * alpha,
+            ]
+            radius = base_radius + (float(zone["next_radius"]) - base_radius) * alpha
+            if self._circle_margin(pos[0], pos[1], center, radius) > padding:
+                lo = mid
+            else:
+                hi = mid
+        return hi
+
+    def _select_hide(
+        self,
+        pos: list[float],
+        center: list[float],
+        radius: float,
+        threats: Iterable[list[float]],
+    ) -> HideSite | None:
+        threat_points = list(threats)
+        best: HideSite | None = None
+        best_score = -1e30
+        safe_radius = max(3.0, radius - 8.0)
+        for site in self.hide_sites:
+            if math.hypot(site.x - center[0], site.y - center[1]) > safe_radius:
+                continue
+            travel = math.hypot(site.x - pos[0], site.y - pos[1])
+            separation = min(
+                (math.hypot(site.x - point[0], site.y - point[1]) for point in threat_points),
+                default=240.0,
+            )
+            # Dense overlapping foliage matters most, then enemy separation.
+            # Travel is deliberately expensive so we do not cross open ground
+            # merely to exchange one adequate canopy for another.
+            score = 16.0 * min(site.score, 6.0) + 0.34 * min(separation, 260.0) - 0.70 * travel
+            if score > best_score:
+                best_score, best = score, site
+        return best
+
+    @staticmethod
     def _lead_aim(me: dict[str, Any], target: dict[str, Any], weapon: dict[str, Any] | None) -> tuple[float, float]:
         x, y, z = me["pos"]
         tx, ty, tz = target["pos"]
@@ -418,8 +523,11 @@ class Bot:
         all_threats = [m for m in obs["mechs"] if m["kind"] == "mech"]
         visible = [m for m in all_threats if self._confirmed_visible(me, m)]
 
-        damaged = [e for e in obs["events"] if e["type"] == "damaged"]
-        if damaged or me["hp"] < self.last_hp - 0.5:
+        damaged = [
+            e for e in obs["events"]
+            if e["type"] == "damaged" and e.get("weapon") != "zone"
+        ]
+        if damaged or (me["in_zone"] and me["hp"] < self.last_hp - 0.5):
             self.last_damage_t = now
             bearings = [float(e["bearing"]) for e in damaged if e.get("bearing") is not None]
             if bearings:
@@ -441,44 +549,42 @@ class Bot:
         danger = max(danger, 0.9 if damaged else 0.0, 0.65 if recent_damage else 0.0)
         danger *= 1.25 if hp_frac < 0.5 else 1.0
 
-        # Refresh a roof destination once per second or when the next circle invalidates it.
+        # The practice opponents are a coordinated squad.  Moving and shooting
+        # reveal us, so stay under dense low foliage and rotate at the latest
+        # survivable instant rather than advertising a route to next center.
         zone = obs["zone"]
-        if self.roof_goal is not None:
-            safe_r = max(6.0, float(zone["next_radius"]) - 7.0)
-            if math.hypot(self.roof_goal.x - zone["next_center"][0], self.roof_goal.y - zone["next_center"][1]) > safe_r:
-                self.roof_goal = None
-        if self.roof_goal is None or now >= self.roof_goal_until:
-            candidate = self._select_roof(obs, [m["pos"] for m in all_threats])
+        target_dist_to_safety = max(
+            0.0,
+            math.hypot(pos[0] - zone["next_center"][0], pos[1] - zone["next_center"][1])
+            - max(0.0, float(zone["next_radius"]) - 9.0),
+        )
+        boundary_cross = self._zone_cross_time(obs)
+        quiet_speed = min(4.7, float(me["stats"].get("walk_speed", 11.7)) * 0.39)
+        travel_deadline = (
+            float(zone["shrink_end"]) + 999.0
+            if target_dist_to_safety <= 0.1
+            else float(zone["shrink_end"]) - target_dist_to_safety / max(quiet_speed, 1.0) - 5.0
+        )
+        self.rotation_deadline = min(boundary_cross - 4.0, travel_deadline)
+        rotating = now >= self.rotation_deadline or not me["in_zone"]
+        target_center = zone["next_center"] if rotating else zone["center"]
+        target_radius = float(zone["next_radius"] if rotating else zone["radius"])
+
+        if self.hide_goal is not None:
+            invalid = math.hypot(self.hide_goal.x - target_center[0], self.hide_goal.y - target_center[1]) > max(3.0, target_radius - 8.0)
+            if invalid:
+                self.hide_goal = None
+        if self.hide_goal is None or now >= self.hide_goal_until:
+            candidate = self._select_hide(pos, target_center, target_radius, [m["pos"] for m in all_threats])
             if candidate is not None:
-                self.roof_goal = candidate
-            # Avoid oscillating between similarly scored roofs as enemies move.
-            self.roof_goal_until = now + 8.0
+                self.hide_goal = candidate
+            self.hide_goal_until = now + (14.0 if all_threats else 25.0)
 
-        on_roof = self.roof_goal is not None and self._inside_roof(pos, self.roof_goal)
-        goal_x, goal_y = zone["next_center"]
-        objective = "zone"
-        if self.roof_goal is not None:
-            goal_x, goal_y = self.roof_goal.x, self.roof_goal.y
-            objective = "roof"
-
-        # Opportunistic cubes first, then an uncontested landed supply drop.
-        safe_items = danger < 0.35 and not recent_damage
-        if safe_items and int(me["cubes"]) < 10 and obs["cubes"]:
-            cube = min(obs["cubes"], key=lambda c: distance2(pos, c["pos"]))
-            threshold = 60.0 if me["cubes"] < 1 else 40.0 if me["cubes"] < 3 else 25.0
-            if not on_roof and distance2(pos, cube["pos"]) < threshold:
-                goal_x, goal_y = cube["pos"][:2]
-                on_roof = False
-                objective = "cube"
-        if safe_items and hp_frac < 0.45:
-            landed = [d for d in obs["drops"] if d["lands_in"] <= 0 and (d["holder"] is None or d["holder"] == me["id"])]
-            if landed:
-                drop = min(landed, key=lambda d: distance2(pos, d["pos"]))
-                contested = any(distance2(drop["pos"], threat["pos"]) < 160.0 for threat in all_threats)
-                if not contested and not on_roof and distance2(pos, drop["pos"]) < 65.0:
-                    goal_x, goal_y = drop["pos"][:2]
-                    on_roof = False
-                    objective = "drop"
+        goal_x, goal_y = target_center
+        if self.hide_goal is not None:
+            goal_x, goal_y = self.hide_goal.x, self.hide_goal.y
+        goal_distance = distance2(pos, (goal_x, goal_y))
+        under_canopy = self.hide_goal is not None and goal_distance < 2.2
 
         # Navigation vector: objective + strong repulsion from the coordinated squad.
         gx, gy = unit(goal_x - pos[0], goal_y - pos[1])
@@ -493,6 +599,16 @@ class Bot:
             if dist < 110.0:
                 move_x += -dy / dist * 0.45 * self.strafe_sign
                 move_y += dx / dist * 0.45 * self.strafe_sign
+
+        # Sound is the only warning before a hunter enters vision.  Treat it as
+        # a soft virtual threat without turning to look and exposing motion.
+        for sound in obs["sounds"]:
+            if float(sound.get("age", 99.0)) > 1.4:
+                continue
+            weight = {"near": 0.75, "mid": 0.34, "far": 0.12}.get(sound.get("dist"), 0.15)
+            bearing = float(sound["bearing"])
+            move_x -= math.cos(bearing) * weight
+            move_y -= math.sin(bearing) * weight
 
         for event in damaged:
             bearing = event.get("bearing")
@@ -513,8 +629,10 @@ class Bot:
             move_x += zx * force
             move_y += zy * force
 
-        # A quiet, regenerating rooftop mech is harder to discover than a runner.
-        settled = on_roof and danger < 0.22 and not recent_damage and distance2(pos, (goal_x, goal_y)) < 12.0
+        # Complete stillness under overlapping crowns is the normal state.
+        contact = recent_damage or nearest_dist < 120.0 or bool(obs["projectiles"])
+        urgent = rotating or not me["in_zone"]
+        settled = under_canopy and not contact and not urgent
         if settled:
             move = [0.0, 0.0]
         else:
@@ -529,59 +647,34 @@ class Bot:
             tangent_component = move[0] * tangent_x + move[1] * tangent_y
             tangent_component = clamp(tangent_component, -0.75, 0.75)
             move = list(unit(inward[0] * 0.55 + tangent_x * tangent_component, inward[1] * 0.55 + tangent_y * tangent_component))
-        elif danger < 0.10 and not recent_damage and not settled and distance2(pos, (goal_x, goal_y)) < 40.0:
-            # Analog movement below 5 m/s is silent.
+        elif not contact and not urgent and not settled:
+            # Analog movement below 5 m/s is silent, even over long rotations.
             quiet = min(0.39, 4.7 / max(float(me["stats"].get("walk_speed", 11.7)), 1.0))
             move = [move[0] * quiet, move[1] * quiet]
 
         act: mf.Action = {"tick": obs["tick"], "move": move}
 
         energy_frac = float(me["energy"]) / max(float(me["max_energy"]), 1.0)
-        climbing = (
-            self.roof_goal is not None
-            and objective == "roof"
-            and not on_roof
-            and (
-                inside_surface(pos[0], pos[1], self.roof_goal.ring, self.roof_goal.holes)
-                or ring_edge_distance(pos[0], pos[1], self.roof_goal.ring) < 8.0
-            )
-            and pos[2] < self.roof_goal.top - 0.8
-        )
-        if climbing:
-            vertical = max(0.0, self.roof_goal.top - pos[2])
-            energy_needed = vertical * float(self.config["mech"]["jet_drain"]) / max(float(self.config["mech"]["max_rise_speed"]), 1.0) + 12.0
-            climb_ready = float(me["energy"]) >= min(float(me["max_energy"]), energy_needed)
-            act["jump"] = bool(me["grounded"] and climb_ready)
-            act["boost"] = bool(not me["grounded"] and climb_ready and energy_frac > 0.08)
-        else:
-            should_sprint = (danger > 0.32 or not me["in_zone"] or distance2(pos, (goal_x, goal_y)) > 90.0) and not settled
-            act["boost"] = should_sprint and energy_frac > (0.18 if danger > 0.7 else 0.35)
-            act["jump"] = bool(me["grounded"] and danger > 0.72 and obs["tick"] % 24 < 2)
+        should_sprint = contact or urgent
+        act["boost"] = should_sprint and not settled and energy_frac > (0.16 if danger > 0.7 else 0.30)
+        act["jump"] = bool(me["grounded"] and danger > 0.72 and obs["tick"] % 24 < 2)
 
         # Pick upgrades immediately; defensive mobility dominates placement value.
         if obs["offer"]:
             act["pick"] = self._upgrade_pick(obs["offer"])
 
-        take, drop = self._take_weapon(obs, danger)
-        if take is not None:
-            act["take"] = take
-            if drop is not None:
-                act["drop"] = drop
+        # Equipping and farming are distractions in the qualification lobby;
+        # the starter gun is retained solely for emergency contact-breaking.
 
-        # Aim at the nearest visible hunter, or at a crate/NPC while safely farming.
+        # Early shots tell all 15 cooperating opponents where to converge.  The
+        # gun is an escape tool until the last circle, not a farming tool.
         attacker_ids = [int(event["by"]) for event in damaged if event.get("by") is not None]
-        target: dict[str, Any] | None = next((m for m in visible if int(m["id"]) in attacker_ids), None)
-        if target is None and visible:
-            target = min(visible, key=lambda m: distance2(pos, m["pos"]))
-        if target is None and danger < 0.15 and hp_frac > 0.85 and now - self.last_damage_t > 8.0:
-            npcs = [m for m in obs["mechs"] if m["kind"] == "npc"]
-            npcs = [m for m in npcs if distance2(pos, m["pos"]) < 25.0 and self._confirmed_visible(me, m)]
-            if npcs:
-                target = min(npcs, key=lambda m: distance2(pos, m["pos"]))
-            elif obs["crates"]:
-                crate = min(obs["crates"], key=lambda c: distance2(pos, c["pos"]))
-                if distance2(pos, crate["pos"]) < 18.0:
-                    target = {"id": crate["id"], "kind": "crate", "pos": crate["pos"], "vel": [0.0, 0.0, 0.0], "hp": crate["hp"]}
+        engage = bool(damaged) or nearest_dist < 42.0 or float(zone["radius"]) <= 72.0 or int(obs["alive"]) <= 4
+        target: dict[str, Any] | None = None
+        if engage:
+            target = next((m for m in visible if int(m["id"]) in attacker_ids), None)
+            if target is None and visible:
+                target = min(visible, key=lambda m: distance2(pos, m["pos"]))
 
         if target is not None:
             primary = me["weapons"][0]
@@ -641,8 +734,8 @@ class Bot:
             if self.last_damage_bearing is not None and now - self.last_damage_bearing_t < 2.0:
                 act["aim"] = [self.last_damage_bearing, 0.0]
             else:
-                # Revisit every bearing before the server's five-second memory expires.
-                act["aim"] = [wrap_angle(now * 1.1 + self.rng.random() * 0.01), -0.03]
+                # Slowly scan while stationary; aim rotation itself is silent.
+                act["aim"] = [wrap_angle(now * 0.32 + self.rng.random() * 0.006), -0.03]
             gun = me["weapons"][0]
             if gun and gun["kind"] == "gun" and gun.get("ammo", 12) < gun["stats"].get("mag", 12) * 0.45:
                 act["reload"] = True
