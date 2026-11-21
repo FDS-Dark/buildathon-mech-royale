@@ -87,7 +87,44 @@ def main() -> None:
         validate(action, obs["tick"])
 
     elapsed = time.perf_counter() - start
-    print(f"PASS: 3000 adversarial observations in {elapsed:.3f}s ({elapsed / 3:.3f} ms/decision)")
+
+    # Regression: a symmetric enemy wall must never push us outward during the
+    # lethal final collapse.
+    final_obs = copy.deepcopy(BASE)
+    final_obs["tick"] = 8000
+    final_obs["t"] = 400.0
+    final_obs["self"]["pos"] = [12.0, 0.0, 0.0]
+    final_obs["self"]["hp"] = 300.0
+    final_obs["self"]["in_zone"] = False
+    final_obs["zone"].update(center=[0.0, 0.0], radius=0.0, next_center=[0.0, 0.0], next_radius=0.0, dps=260.0)
+    final_obs["mechs"] = []
+    for i in range(8):
+        angle = -0.8 + i * 1.6 / 7
+        final_obs["mechs"].append(
+            {"id": i + 4, "kind": "mech", "pos": [12 + 25 * math.cos(angle), 25 * math.sin(angle), 0],
+             "vel": [0, 0, 0], "aim": [math.pi, 0], "hp": 1400, "max_hp": 1400,
+             "cubes": 0, "weapons": ["gun"], "charging": False}
+        )
+    action = bot.act(final_obs)
+    assert action["move"][0] < -0.25, action
+
+    # Regression: never start charging a laser while escaping a close hunter.
+    laser_obs = copy.deepcopy(BASE)
+    laser_obs["tick"] = 8002
+    laser_obs["t"] = 400.1
+    laser_obs["self"]["weapons"][1] = {
+        "kind": "laser", "cooldown": 0, "charge": 0,
+        "stats": {"damage": 315, "charge": 0.75, "range": 280},
+    }
+    laser_obs["mechs"] = [
+        {"id": 7, "kind": "mech", "pos": [laser_obs["self"]["pos"][0] + 20, laser_obs["self"]["pos"][1], laser_obs["self"]["pos"][2]],
+         "vel": [0, 0, 0], "aim": [math.pi, 0], "hp": 1400, "max_hp": 1400,
+         "cubes": 0, "weapons": ["gun", "lightning"], "charging": False}
+    ]
+    action = bot.act(laser_obs)
+    assert not action.get("fire", [False, False])[1], action
+
+    print(f"PASS: 3000 adversarial observations + state regressions in {elapsed:.3f}s ({elapsed / 3:.3f} ms/decision)")
 
 
 if __name__ == "__main__":
