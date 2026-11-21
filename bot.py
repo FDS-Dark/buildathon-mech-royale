@@ -164,7 +164,7 @@ class Roof:
 
 
 class Bot:
-    name = "roof-rat-v2"
+    name = "chimney-rat-x1"
 
     def __init__(self, hello: mf.Hello):
         self.config = hello["config"]
@@ -173,6 +173,9 @@ class Bot:
         self.memory_s = float(self.config["vision"]["memory_s"])
         self.prisms: list[dict[str, Any]] = []
         self.roofs = self._load_roofs(hello)
+        self.chimney_lower = self._special_surface(-3.2, 33.0, 18.0)
+        self.chimney_tower = self._special_surface(-6.64, 30.24, 66.91)
+        self.chimney_state = "approach"
         self.enemy_memory: dict[int, tuple[float, list[float], list[float], float]] = {}
         self.roof_goal: Roof | None = None
         self.roof_goal_until = 0.0
@@ -183,6 +186,51 @@ class Bot:
         self.last_damage_bearing_t = -999.0
         self.strafe_sign = -1.0 if hello["slot"] & 1 else 1.0
         self.last_strafe_flip_t = -999.0
+
+    def _special_surface(self, x: float, y: float, top: float) -> Roof | None:
+        candidates = [
+            solid for solid in self.prisms
+            if abs(float(solid.get("top", -999.0)) - top) < 0.2
+            and len(solid.get("ring", [])) >= 6
+            and inside_surface(x, y, solid["ring"], solid.get("holes", []))
+        ]
+        if not candidates:
+            return None
+        solid = min(candidates, key=lambda value: polygon_area(value["ring"]))
+        return Roof(
+            x=x,
+            y=y,
+            top=top,
+            area=polygon_area(solid["ring"]),
+            clearance=max(0.0, surface_clearance(x, y, solid["ring"], solid.get("holes", []))),
+            ring=solid["ring"],
+            holes=solid.get("holes", []),
+        )
+
+    def _chimney_objective(self, obs: mf.Observation) -> tuple[Roof | None, bool]:
+        if self.chimney_state == "disabled" or self.chimney_lower is None or self.chimney_tower is None:
+            return None, False
+        me = obs["self"]
+        zone = obs["zone"]
+        tower_distance = math.hypot(
+            self.chimney_tower.x - zone["next_center"][0], self.chimney_tower.y - zone["next_center"][1]
+        )
+        # One cube makes the 5.1 m stack top too tight for our enlarged body.
+        safe = me["cubes"] == 0 and tower_distance < float(zone["next_radius"]) - 5.0 and float(zone["next_radius"]) >= 70.0
+        if not safe:
+            self.chimney_state = "disabled"
+            return None, False
+
+        if self.chimney_state == "approach" and self._inside_roof(me["pos"], self.chimney_lower, 2.2):
+            self.chimney_state = "recharge"
+        if self.chimney_state == "recharge" and float(me["energy"]) >= 95.0:
+            self.chimney_state = "ascend"
+        if self.chimney_state == "ascend" and self._inside_roof(me["pos"], self.chimney_tower, 2.2):
+            self.chimney_state = "hold"
+
+        if self.chimney_state in ("approach", "recharge"):
+            return self.chimney_lower, self.chimney_state == "recharge"
+        return self.chimney_tower, self.chimney_state == "hold"
 
     def _load_roofs(self, hello: mf.Hello) -> list[Roof]:
         try:
@@ -454,6 +502,11 @@ class Bot:
             # Avoid oscillating between similarly scored roofs as enemies move.
             self.roof_goal_until = now + 8.0
 
+        chimney_goal, chimney_hold = self._chimney_objective(obs)
+        if chimney_goal is not None:
+            self.roof_goal = chimney_goal
+            self.roof_goal_until = now + 30.0
+
         on_roof = self.roof_goal is not None and self._inside_roof(pos, self.roof_goal)
         goal_x, goal_y = zone["next_center"]
         objective = "zone"
@@ -463,7 +516,7 @@ class Bot:
 
         # Opportunistic cubes first, then an uncontested landed supply drop.
         safe_items = danger < 0.35 and not recent_damage
-        if safe_items and int(me["cubes"]) < 10 and obs["cubes"]:
+        if safe_items and self.chimney_state == "disabled" and int(me["cubes"]) < 10 and obs["cubes"]:
             cube = min(obs["cubes"], key=lambda c: distance2(pos, c["pos"]))
             threshold = 60.0 if me["cubes"] < 1 else 40.0 if me["cubes"] < 3 else 25.0
             if not on_roof and distance2(pos, cube["pos"]) < threshold:
@@ -515,7 +568,9 @@ class Bot:
 
         # A quiet, regenerating rooftop mech is harder to discover than a runner.
         settled = on_roof and danger < 0.22 and not recent_damage and distance2(pos, (goal_x, goal_y)) < 12.0
-        if settled:
+        if chimney_hold:
+            move = [0.0, 0.0]
+        elif settled:
             move = [0.0, 0.0]
         else:
             move = list(unit(move_x, move_y))
@@ -548,6 +603,8 @@ class Bot:
             and pos[2] < self.roof_goal.top - 0.8
         )
         if climbing:
+            if self.chimney_state in ("approach", "ascend"):
+                act["move"] = list(unit(self.roof_goal.x - pos[0], self.roof_goal.y - pos[1]))
             vertical = max(0.0, self.roof_goal.top - pos[2])
             energy_needed = vertical * float(self.config["mech"]["jet_drain"]) / max(float(self.config["mech"]["max_rise_speed"]), 1.0) + 12.0
             climb_ready = float(me["energy"]) >= min(float(me["max_energy"]), energy_needed)
@@ -557,6 +614,9 @@ class Bot:
             should_sprint = (danger > 0.32 or not me["in_zone"] or distance2(pos, (goal_x, goal_y)) > 90.0) and not settled
             act["boost"] = should_sprint and energy_frac > (0.18 if danger > 0.7 else 0.35)
             act["jump"] = bool(me["grounded"] and danger > 0.72 and obs["tick"] % 24 < 2)
+        if chimney_hold:
+            act["boost"] = False
+            act["jump"] = False
 
         # Pick upgrades immediately; defensive mobility dominates placement value.
         if obs["offer"]:
